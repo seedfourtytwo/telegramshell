@@ -68,41 +68,11 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         await update.message.reply_text("No running command to stop.")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle any message as a potential command."""
-    if not is_authenticated(update):
-        return
-
-    text = update.message.text
-    if not text:
-        return
-
-    # Convert first word to lowercase to handle phone capitalization
-    parts = text.split(maxsplit=1)
-    if not parts:
-        return
-
-    # Get the command and arguments
-    command = parts[0].lower()
-    args = parts[1] if len(parts) > 1 else ""
-
-    # Remove leading / if present
-    if command.startswith('/'):
-        command = command[1:]
-
-    # Skip bot commands
-    if command in ('start', 'auth', 'help', 'stop'):
-        return
-
-    # Reconstruct the command
-    full_command = f"{command} {args}".strip()
-
-    # Log command execution
-    log_command(update.effective_user, full_command)
-    
+async def execute_shell_command(update: Update, command: str) -> None:
+    """Execute a shell command and return the output."""
     try:
         process = await asyncio.create_subprocess_shell(
-            full_command,
+            command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -130,6 +100,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(f"Error executing command: {str(e)}")
         if update.effective_user.id in user_processes:
             del user_processes[update.effective_user.id]
+
+async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle commands that start with /."""
+    if not is_authenticated(update):
+        return
+
+    command = update.message.text[1:]  # Remove the leading /
+    if command.split()[0].lower() in ('start', 'auth', 'help', 'stop'):
+        return
+
+    # Log command execution
+    log_command(update.effective_user, command)
+    await execute_shell_command(update, command)
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle regular text messages as commands."""
+    if not is_authenticated(update):
+        return
+
+    command = update.message.text.strip()
+    if not command:
+        return
+
+    # Log command execution
+    log_command(update.effective_user, command)
+    await execute_shell_command(update, command)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show help message."""
@@ -168,15 +164,15 @@ def main() -> None:
     # Create the Application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Add command handlers
+    # Add command handlers for specific commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("auth", auth))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("stop", stop_command))
     
-    # Handle all messages (with or without /)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.COMMAND, handle_message))
+    # Handle all other messages
+    application.add_handler(MessageHandler(filters.COMMAND, handle_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # Start the Bot
     application.run_polling(allowed_updates=Update.ALL_TYPES)
