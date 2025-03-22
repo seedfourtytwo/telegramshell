@@ -14,41 +14,57 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # Create telegram_bot user if it doesn't exist
 if ! id "telegram_bot" &>/dev/null; then
-    adduser --disabled-password --gecos "" telegram_bot
-    echo "Created telegram_bot user"
+    useradd -m -s /bin/bash telegram_bot
 fi
 
-# Set up project directory
-BOT_DIR=/home/telegram_bot/telegramShell
-mkdir -p $BOT_DIR
+# Create the installation directory
+mkdir -p /opt/telegram-shell-bot
 
-# Copy files from current directory
-echo "Copying files from $SCRIPT_DIR to $BOT_DIR"
-cp -r "$SCRIPT_DIR"/{bot.py,requirements.txt,telegram-shell-bot.service,.env,.env.example} $BOT_DIR/
-chown -R telegram_bot:telegram_bot $BOT_DIR
+# Copy all necessary files
+cp -r * /opt/telegram-shell-bot/
+cp .env /opt/telegram-shell-bot/ 2>/dev/null || true
 
-# Set up Python virtual environment
-echo "Setting up Python virtual environment..."
-su - telegram_bot -c "python3 -m venv $BOT_DIR/venv"
-su - telegram_bot -c "$BOT_DIR/venv/bin/pip install -r $BOT_DIR/requirements.txt"
+# Set ownership
+chown -R telegram_bot:telegram_bot /opt/telegram-shell-bot
 
-# Set up systemd service
-echo "Setting up systemd service..."
-cp $BOT_DIR/telegram-shell-bot.service /etc/systemd/system/
+# Create and configure the service file
+cat > /etc/systemd/system/telegram-shell-bot.service << EOL
+[Unit]
+Description=Telegram Shell Bot
+After=network.target
+
+[Service]
+Type=simple
+User=telegram_bot
+WorkingDirectory=/opt/telegram-shell-bot
+ExecStart=/usr/bin/python3 bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+# Configure sudoers for telegram_bot user
+cat > /etc/sudoers.d/telegram_bot << EOL
+# Allow telegram_bot to execute specific commands without password
+telegram_bot ALL=(ALL) NOPASSWD: /usr/bin/tail -f /var/log/syslog
+telegram_bot ALL=(ALL) NOPASSWD: /usr/bin/tail -f /var/log/*
+telegram_bot ALL=(ALL) NOPASSWD: /usr/bin/journalctl
+telegram_bot ALL=(ALL) NOPASSWD: /usr/bin/systemctl status *
+telegram_bot ALL=(ALL) NOPASSWD: /usr/bin/docker ps
+telegram_bot ALL=(ALL) NOPASSWD: /usr/bin/docker logs *
+EOL
+
+# Set proper permissions for sudoers file
+chmod 0440 /etc/sudoers.d/telegram_bot
+
+# Reload systemd and start the service
 systemctl daemon-reload
 systemctl enable telegram-shell-bot
 systemctl restart telegram-shell-bot
 
-# Set up sudo permissions
-echo "Setting up sudo permissions..."
-cat > /etc/sudoers.d/telegram_bot << EOF
-# Allow telegram_bot to run specific commands without password
-telegram_bot ALL=(ALL) NOPASSWD: /usr/bin/tail, /usr/bin/tail -f /var/log/*, /bin/ls, /usr/bin/df, /usr/bin/ps, /usr/bin/htop, /usr/bin/systemctl, /usr/bin/journalctl, /usr/bin/docker, /bin/cat, /usr/bin/head
-EOF
-chmod 0440 /etc/sudoers.d/telegram_bot
-
-echo "Deployment complete! Checking service status..."
-systemctl status telegram-shell-bot
+echo "Deployment completed successfully!"
 
 echo "You can check logs with: sudo journalctl -u telegram-shell-bot -f"
 
