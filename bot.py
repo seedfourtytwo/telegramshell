@@ -79,24 +79,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Convert first word to lowercase to handle phone capitalization
     parts = text.split(maxsplit=1)
-    if len(parts) > 0:
-        # Convert first word to lowercase
-        parts[0] = parts[0].lower()
-        # Remove leading / if present
-        if parts[0].startswith('/'):
-            parts[0] = parts[0][1:]
-        text = ' '.join(parts)
-
-    # Skip actual commands
-    if text.lower().startswith(('start', 'auth', 'help', 'stop')):
+    if not parts:
         return
 
+    # Get the command and arguments
+    command = parts[0].lower()
+    args = parts[1] if len(parts) > 1 else ""
+
+    # Remove leading / if present
+    if command.startswith('/'):
+        command = command[1:]
+
+    # Skip bot commands
+    if command in ('start', 'auth', 'help', 'stop'):
+        return
+
+    # Reconstruct the command
+    full_command = f"{command} {args}".strip()
+
     # Log command execution
-    log_command(update.effective_user, text)
+    log_command(update.effective_user, full_command)
     
     try:
         process = await asyncio.create_subprocess_shell(
-            text,
+            full_command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
