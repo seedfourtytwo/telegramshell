@@ -76,17 +76,42 @@ async def execute_shell_command(update: Update, command: str) -> None:
         if not parts:
             return
         
+        # Convert command to lowercase and handle paths
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
-        
-        # List of commands that need sudo
-        sudo_commands = ['tail', 'journalctl', 'systemctl', 'service', 'docker']
-        
-        # Add sudo if needed
-        if cmd in sudo_commands:
-            command = f"sudo {cmd} {args}"
+
+        # Map of common commands to their full paths
+        cmd_paths = {
+            'ls': '/bin/ls',
+            'tail': '/usr/bin/tail',
+            'ps': '/usr/bin/ps',
+            'df': '/usr/bin/df',
+            'htop': '/usr/bin/htop',
+            'cat': '/bin/cat',
+            'head': '/usr/bin/head',
+            'docker': '/usr/bin/docker',
+            'systemctl': '/usr/bin/systemctl',
+            'journalctl': '/usr/bin/journalctl'
+        }
+
+        # Commands that need sudo
+        sudo_commands = ['tail', 'journalctl', 'systemctl', 'docker']
+
+        # Build the command with proper path and sudo if needed
+        if cmd in cmd_paths:
+            if cmd in sudo_commands:
+                command = f"sudo {cmd_paths[cmd]} {args}"
+            else:
+                command = f"{cmd_paths[cmd]} {args}"
         else:
-            command = f"{cmd} {args}"
+            # For other commands, just use lowercase version
+            if cmd in sudo_commands:
+                command = f"sudo {cmd} {args}"
+            else:
+                command = f"{cmd} {args}"
+
+        # Log the actual command being executed
+        print(f"Executing command: {command}")
 
         process = await asyncio.create_subprocess_shell(
             command,
@@ -164,7 +189,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 def is_authenticated(update: Update) -> bool:
     """Check if user is authenticated."""
     if update.effective_user.id not in authenticated_users:
-        update.message.reply_text("Please authenticate first using /auth <password>")
+        # Fix the unawaited coroutine
+        asyncio.create_task(update.message.reply_text("Please authenticate first using /auth <password>"))
         return False
     return True
 

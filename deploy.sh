@@ -43,7 +43,7 @@ systemctl restart telegram-shell-bot
 echo "Setting up sudo permissions..."
 cat > /etc/sudoers.d/telegram_bot << EOF
 # Allow telegram_bot to run specific commands without password
-telegram_bot ALL=(ALL) NOPASSWD: /usr/bin/tail, /bin/ls, /usr/bin/df, /usr/bin/ps, /usr/bin/htop, /usr/bin/systemctl, /usr/bin/journalctl, /usr/bin/docker, /bin/cat, /usr/bin/head
+telegram_bot ALL=(ALL) NOPASSWD: /usr/bin/tail, /usr/bin/tail -f /var/log/*, /bin/ls, /usr/bin/df, /usr/bin/ps, /usr/bin/htop, /usr/bin/systemctl, /usr/bin/journalctl, /usr/bin/docker, /bin/cat, /usr/bin/head
 EOF
 chmod 0440 /etc/sudoers.d/telegram_bot
 
