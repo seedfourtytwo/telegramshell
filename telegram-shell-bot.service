@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Shell Bot
+After=network.target
+
+[Service]
+Type=simple
+User=telegram_bot
+WorkingDirectory=/home/telegram_bot/telegramShell
+Environment=PATH=/home/telegram_bot/telegramShell/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/telegram_bot/telegramShell/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target 
