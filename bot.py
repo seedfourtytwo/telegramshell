@@ -71,6 +71,10 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def execute_shell_command(update: Update, command: str) -> None:
     """Execute a shell command and return the output."""
     try:
+        # Remove 'sudo' if user added it
+        if command.startswith('sudo '):
+            command = command[5:]
+
         # Convert first word to lowercase for case-insensitive commands
         parts = command.split(maxsplit=1)
         if not parts:
@@ -110,7 +114,11 @@ async def execute_shell_command(update: Update, command: str) -> None:
             else:
                 command = f"{cmd} {args}"
 
-        # Log the actual command being executed
+        # Special handling for tail command with log files
+        if cmd == 'tail' and '/var/log' in args:
+            command = f"sudo {cmd_paths['tail']} {args}"
+
+        # Log the actual command being executed for debugging
         print(f"Executing command: {command}")
 
         process = await asyncio.create_subprocess_shell(
@@ -189,7 +197,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 def is_authenticated(update: Update) -> bool:
     """Check if user is authenticated."""
     if update.effective_user.id not in authenticated_users:
-        # Fix the unawaited coroutine
         asyncio.create_task(update.message.reply_text("Please authenticate first using /auth <password>"))
         return False
     return True
