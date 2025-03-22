@@ -1,5 +1,6 @@
 import os
 import asyncio
+import signal
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
@@ -13,8 +14,9 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 ALLOWED_USERS = [int(uid) for uid in os.getenv('ALLOWED_USERS', '').split(',') if uid]
 BOT_PASSWORD = os.getenv('BOT_PASSWORD')
 
-# Store authenticated users
+# Store authenticated users and running processes
 authenticated_users = set()
+user_processes = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
@@ -26,11 +28,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Welcome to Secure Shell Bot!\n"
         "Please authenticate using /auth <password>\n\n"
         "Tips:\n"
-        "1. Open multiple chat windows with this bot\n"
-        "2. Just type commands directly: ls -la\n"
-        "3. Or prefix with /: /ls -la\n"
-        "4. For logs: tail -f /path/to/log\n"
-        "5. Press Ctrl+C in Telegram to stop viewing output"
+        "1. Just type commands directly: ls -la\n"
+        "2. Commands are case-insensitive\n"
+        "3. Use /stop to end running commands\n"
+        "4. Open multiple chats for different tasks"
     )
 
 async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -49,6 +50,24 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text("Invalid password.")
 
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop running command for the user."""
+    if not is_authenticated(update):
+        return
+
+    user_id = update.effective_user.id
+    if user_id in user_processes:
+        process = user_processes[user_id]
+        try:
+            process.terminate()
+            process.kill()  # Force kill if terminate doesn't work
+            del user_processes[user_id]
+            await update.message.reply_text("Command stopped.")
+        except Exception as e:
+            await update.message.reply_text(f"Error stopping command: {str(e)}")
+    else:
+        await update.message.reply_text("No running command to stop.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle any message as a potential command."""
     if not is_authenticated(update):
@@ -58,23 +77,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text:
         return
 
-    # Strip leading / if present
-    command = text[1:] if text.startswith('/') else text
-    
+    # Convert first word to lowercase to handle phone capitalization
+    parts = text.split(maxsplit=1)
+    if len(parts) > 0:
+        # Convert first word to lowercase
+        parts[0] = parts[0].lower()
+        # Remove leading / if present
+        if parts[0].startswith('/'):
+            parts[0] = parts[0][1:]
+        text = ' '.join(parts)
+
     # Skip actual commands
-    if command.startswith(('start', 'auth', 'help')):
+    if text.lower().startswith(('start', 'auth', 'help', 'stop')):
         return
 
     # Log command execution
-    log_command(update.effective_user, command)
+    log_command(update.effective_user, text)
     
     try:
         process = await asyncio.create_subprocess_shell(
-            command,
+            text,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
+        
+        # Store process for potential stopping
+        user_id = update.effective_user.id
+        user_processes[user_id] = process
+        
         stdout, stderr = await process.communicate()
+        
+        # Clear process from storage after it's done
+        if user_id in user_processes:
+            del user_processes[user_id]
         
         output = stdout.decode() if stdout else stderr.decode()
         if not output:
@@ -87,6 +122,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
     except Exception as e:
         await update.message.reply_text(f"Error executing command: {str(e)}")
+        if update.effective_user.id in user_processes:
+            del user_processes[update.effective_user.id]
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show help message."""
@@ -98,10 +135,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- List files: ls -la\n"
         "- Monitor log: tail -f /var/log/syslog\n"
         "- System info: htop\n"
-        "- Disk space: df -h\n"
-        "- Process list: ps aux\n\n"
-        "You can also prefix commands with / if you prefer:\n"
-        "/ls -la, /tail -f /var/log/syslog, etc."
+        "- Stop command: /stop\n"
+        "\nTips:\n"
+        "- Commands are case-insensitive\n"
+        "- Use /stop to end running commands\n"
+        "- Open multiple chats for different tasks"
     )
 
 def is_authenticated(update: Update) -> bool:
@@ -128,6 +166,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("auth", auth))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("stop", stop_command))
     
     # Handle all messages (with or without /)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
