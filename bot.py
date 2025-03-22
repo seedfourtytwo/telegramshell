@@ -71,6 +71,23 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def execute_shell_command(update: Update, command: str) -> None:
     """Execute a shell command and return the output."""
     try:
+        # Convert first word to lowercase for case-insensitive commands
+        parts = command.split(maxsplit=1)
+        if not parts:
+            return
+        
+        cmd = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+        
+        # List of commands that need sudo
+        sudo_commands = ['tail', 'journalctl', 'systemctl', 'service', 'docker']
+        
+        # Add sudo if needed
+        if cmd in sudo_commands:
+            command = f"sudo {cmd} {args}"
+        else:
+            command = f"{cmd} {args}"
+
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
