@@ -1,6 +1,7 @@
 import os
 import asyncio
 import signal
+import psutil
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
@@ -59,8 +60,19 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if user_id in user_processes:
         process = user_processes[user_id]
         try:
-            process.terminate()
-            process.kill()  # Force kill if terminate doesn't work
+            # Get the process group ID
+            pgid = os.getpgid(process.pid)
+            
+            # Kill the entire process group
+            os.killpg(pgid, signal.SIGTERM)
+            
+            # Wait a bit and force kill if still running
+            await asyncio.sleep(1)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # Process already terminated
+                
             del user_processes[user_id]
             await update.message.reply_text("Command stopped.")
         except Exception as e:
@@ -79,7 +91,7 @@ async def execute_shell_command(update: Update, command: str) -> None:
         parts = command.split(maxsplit=1)
         if not parts:
             return
-        
+
         # Convert command to lowercase and handle paths
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
@@ -95,7 +107,8 @@ async def execute_shell_command(update: Update, command: str) -> None:
             'head': '/usr/bin/head',
             'docker': '/usr/bin/docker',
             'systemctl': '/usr/bin/systemctl',
-            'journalctl': '/usr/bin/journalctl'
+            'journalctl': '/usr/bin/journalctl',
+            'ping': '/usr/bin/ping'
         }
 
         # Commands that need sudo
@@ -121,31 +134,41 @@ async def execute_shell_command(update: Update, command: str) -> None:
         # Log the actual command being executed for debugging
         print(f"Executing command: {command}")
 
+        # Create a new process group
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            preexec_fn=os.setsid  # Create new process group
         )
-        
+
         # Store process for potential stopping
         user_id = update.effective_user.id
-        user_processes[user_id] = process
-        
-        stdout, stderr = await process.communicate()
-        
-        # Clear process from storage after it's done
         if user_id in user_processes:
+            # Kill any existing process before starting new one
+            try:
+                old_pgid = os.getpgid(user_processes[user_id].pid)
+                os.killpg(old_pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+
+        user_processes[user_id] = process
+
+        stdout, stderr = await process.communicate()
+
+        # Clear process from storage after it's done
+        if user_id in user_processes and user_processes[user_id] == process:
             del user_processes[user_id]
-        
+
         output = stdout.decode() if stdout else stderr.decode()
         if not output:
             output = "Command executed successfully (no output)"
-            
+
         # Split long outputs into chunks to avoid Telegram message length limits
         for i in range(0, len(output), 4000):
             chunk = output[i:i+4000]
             await update.message.reply_text(f"```\n{chunk}\n```", parse_mode='Markdown')
-            
+
     except Exception as e:
         await update.message.reply_text(f"Error executing command: {str(e)}")
         if update.effective_user.id in user_processes:
