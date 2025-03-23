@@ -4,7 +4,7 @@
 set -e
 
 # Check if running as root
-if [ "$EUID" -ne 0 ]; then 
+if [ "$EUID" -ne 0 ]; then
     echo "Please run as root"
     exit 1
 fi
@@ -17,15 +17,23 @@ if ! id "telegram_bot" &>/dev/null; then
     useradd -m -s /bin/bash telegram_bot
 fi
 
-# Create the installation directory
-mkdir -p /opt/telegram-shell-bot
+# Set up project directory
+BOT_DIR=/home/telegram_bot/telegramShell
+mkdir -p $BOT_DIR
 
-# Copy all necessary files
-cp -r * /opt/telegram-shell-bot/
-cp .env /opt/telegram-shell-bot/ 2>/dev/null || true
+# Copy files from current directory
+echo "Copying files to $BOT_DIR"
+cp -r "$SCRIPT_DIR"/{bot.py,requirements.txt,.env} $BOT_DIR/
+chown -R telegram_bot:telegram_bot $BOT_DIR
 
-# Set ownership
-chown -R telegram_bot:telegram_bot /opt/telegram-shell-bot
+# Install system dependencies
+apt-get update
+apt-get install -y python3-venv
+
+# Set up Python virtual environment
+echo "Setting up Python virtual environment..."
+su - telegram_bot -c "python3 -m venv $BOT_DIR/venv"
+su - telegram_bot -c "$BOT_DIR/venv/bin/pip install python-telegram-bot python-dotenv"
 
 # Create and configure the service file
 cat > /etc/systemd/system/telegram-shell-bot.service << EOL
@@ -36,8 +44,8 @@ After=network.target
 [Service]
 Type=simple
 User=telegram_bot
-WorkingDirectory=/opt/telegram-shell-bot
-ExecStart=/usr/bin/python3 bot.py
+WorkingDirectory=$BOT_DIR
+ExecStart=$BOT_DIR/venv/bin/python bot.py
 Restart=always
 RestartSec=10
 
@@ -65,7 +73,6 @@ systemctl enable telegram-shell-bot
 systemctl restart telegram-shell-bot
 
 echo "Deployment completed successfully!"
-
 echo "You can check logs with: sudo journalctl -u telegram-shell-bot -f"
 
 echo "Please set up your .env file with:"
