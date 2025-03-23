@@ -28,14 +28,51 @@ BOT_PASSWORD = os.getenv('BOT_PASSWORD')
 # Store authenticated users and running processes
 authenticated_users = set()
 user_processes = {}
+user_tasks = {}
 
 def is_continuous_command(command: str) -> bool:
     """Check if a command is expected to run continuously."""
     continuous_commands = ['ping', 'tail -f', 'top', 'htop', 'watch']
     return any(cmd in command.lower() for cmd in continuous_commands)
 
+async def read_stream(stream, callback):
+    """Read from a stream and call callback for each line."""
+    try:
+        while True:
+            line = await stream.readline()
+            if not line:  # EOF
+                break
+            await callback(line.decode().strip())
+    except asyncio.CancelledError:
+        print("Stream reading was cancelled", file=sys.stderr, flush=True)
+        raise
+
 async def handle_continuous_command(command: str, update: Update) -> None:
     """Handle a continuous command with real-time output."""
+    print(f"Starting continuous command: {command}", file=sys.stderr, flush=True)
+    
+    user_id = update.effective_user.id
+    
+    # Kill any existing process and task
+    if user_id in user_processes:
+        print(f"Killing existing process for user {user_id}", file=sys.stderr, flush=True)
+        try:
+            process = user_processes[user_id]
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            del user_processes[user_id]
+        except:
+            pass
+        
+    if user_id in user_tasks:
+        print(f"Cancelling existing task for user {user_id}", file=sys.stderr, flush=True)
+        try:
+            task = user_tasks[user_id]
+            task.cancel()
+            await task  # Wait for task to be cancelled
+            del user_tasks[user_id]
+        except:
+            pass
+
     try:
         # Create process
         process = await asyncio.create_subprocess_shell(
@@ -44,69 +81,82 @@ async def handle_continuous_command(command: str, update: Update) -> None:
             stderr=asyncio.subprocess.PIPE,
             preexec_fn=os.setsid
         )
-        print(f"Started continuous command: {command} with PID {process.pid}", file=sys.stderr)
-
-        # Store process
-        user_id = update.effective_user.id
-        if user_id in user_processes:
-            try:
-                old_process = user_processes[user_id]
-                os.killpg(os.getpgid(old_process.pid), signal.SIGKILL)
-            except:
-                pass
+        print(f"Process created with PID: {process.pid}", file=sys.stderr, flush=True)
+        
         user_processes[user_id] = process
-
+        
         # Send initial message
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             "Running continuous command. Output will be streamed.\n"
             "Use /stop to end the command."
         )
 
-        # Stream output
-        while True:
-            if process.returncode is not None:
-                print(f"Process ended with return code: {process.returncode}", file=sys.stderr)
-                break
-
+        # Create callback for output
+        async def handle_output(line):
             try:
-                # Read with timeout to allow checking returncode
-                stdout_data = await asyncio.wait_for(process.stdout.readline(), timeout=1.0)
-                if stdout_data:
-                    line = stdout_data.decode().strip()
-                    print(f"Output: {line}", file=sys.stderr)
-                    await update.message.reply_text(f"`{line}`", parse_mode='Markdown')
-
-                stderr_data = await asyncio.wait_for(process.stderr.readline(), timeout=1.0)
-                if stderr_data:
-                    line = stderr_data.decode().strip()
-                    print(f"Error: {line}", file=sys.stderr)
-                    await update.message.reply_text(f"Error: `{line}`", parse_mode='Markdown')
-
-            except asyncio.TimeoutError:
-                continue
+                await update.message.reply_text(f"`{line}`", parse_mode='Markdown')
+                print(f"Sent output: {line}", file=sys.stderr, flush=True)
             except Exception as e:
-                print(f"Error reading output: {str(e)}", file=sys.stderr)
-                await update.message.reply_text(f"Error: {str(e)}")
-                break
+                print(f"Error sending message: {e}", file=sys.stderr, flush=True)
 
+        # Start reading streams in the background
+        stdout_task = asyncio.create_task(read_stream(process.stdout, handle_output))
+        stderr_task = asyncio.create_task(read_stream(process.stderr, handle_output))
+        
+        # Store tasks
+        combined_task = asyncio.gather(stdout_task, stderr_task)
+        user_tasks[user_id] = combined_task
+        
+        try:
+            # Wait for either process to complete or tasks to finish
+            done, pending = await asyncio.wait(
+                [process.wait(), combined_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Cancel any pending tasks
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                
+            print(f"Process completed with return code: {process.returncode}", file=sys.stderr, flush=True)
+            
+        except asyncio.CancelledError:
+            print("Task was cancelled", file=sys.stderr, flush=True)
+            raise
+        
     except Exception as e:
-        print(f"Error in continuous command: {str(e)}", file=sys.stderr)
+        print(f"Error in continuous command: {str(e)}", file=sys.stderr, flush=True)
         await update.message.reply_text(f"Error: {str(e)}")
-
     finally:
         # Clean up
-        try:
-            if process.returncode is None:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except:
-            pass
-
         if user_id in user_processes:
+            try:
+                process = user_processes[user_id]
+                if process.returncode is None:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                print(f"Killed process for user {user_id}", file=sys.stderr, flush=True)
+            except:
+                pass
             del user_processes[user_id]
+        
+        if user_id in user_tasks:
+            try:
+                task = user_tasks[user_id]
+                task.cancel()
+                await task  # Wait for task to be cancelled
+                print(f"Cancelled task for user {user_id}", file=sys.stderr, flush=True)
+            except:
+                pass
+            del user_tasks[user_id]
 
 async def execute_shell_command(update: Update, command: str) -> None:
     """Execute a shell command and return the output."""
-    print(f"Executing command: {command}", file=sys.stderr)
+    print(f"Executing command: {command}", file=sys.stderr, flush=True)
+    
     try:
         # Remove 'sudo' if user added it
         if command.startswith('sudo '):
@@ -160,16 +210,16 @@ async def execute_shell_command(update: Update, command: str) -> None:
         if cmd == 'tail' and '/var/log' in args:
             command = f"sudo {cmd_paths['tail']} {args}"
 
-        print(f"Final command: {command}", file=sys.stderr)
+        print(f"Final command: {command}", file=sys.stderr, flush=True)
 
         # Check if this is a continuous command
         if is_continuous_command(command):
-            print("Handling as continuous command", file=sys.stderr)
+            print("Handling as continuous command", file=sys.stderr, flush=True)
             await handle_continuous_command(command, update)
             return
 
         # For regular commands, just run and return output
-        print("Handling as regular command", file=sys.stderr)
+        print("Handling as regular command", file=sys.stderr, flush=True)
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
@@ -185,7 +235,7 @@ async def execute_shell_command(update: Update, command: str) -> None:
             await update.message.reply_text(f"```\n{chunk}\n```", parse_mode='Markdown')
 
     except Exception as e:
-        print(f"Error executing command: {str(e)}", file=sys.stderr)
+        print(f"Error executing command: {str(e)}", file=sys.stderr, flush=True)
         await update.message.reply_text(f"Error executing command: {str(e)}")
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -194,16 +244,30 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     user_id = update.effective_user.id
+    stopped = False
+
     if user_id in user_processes:
-        process = user_processes[user_id]
         try:
+            process = user_processes[user_id]
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
             del user_processes[user_id]
-            await update.message.reply_text("Command stopped.")
-            print(f"Stopped process for user {user_id}", file=sys.stderr)
+            stopped = True
+            print(f"Killed process for user {user_id}", file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"Error stopping process: {str(e)}", file=sys.stderr)
-            await update.message.reply_text(f"Error stopping command: {str(e)}")
+            print(f"Error killing process: {str(e)}", file=sys.stderr, flush=True)
+
+    if user_id in user_tasks:
+        try:
+            task = user_tasks[user_id]
+            task.cancel()
+            del user_tasks[user_id]
+            stopped = True
+            print(f"Cancelled task for user {user_id}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"Error cancelling task: {str(e)}", file=sys.stderr, flush=True)
+
+    if stopped:
+        await update.message.reply_text("Command stopped.")
     else:
         await update.message.reply_text("No running command to stop.")
 
