@@ -28,34 +28,14 @@ BOT_PASSWORD = os.getenv('BOT_PASSWORD')
 authenticated_users = set()
 user_processes = {}
 
-# Commands that are known to run continuously
-CONTINUOUS_COMMANDS = [
-    'ping',           # Network connectivity testing
-    'tail -f',        # File monitoring
-    'top',           # Process monitoring
-    'htop',          # Interactive process monitoring
-    'watch',         # Periodic command execution
-    'tcpdump',       # Network packet capture
-    'iotop',         # I/O monitoring
-    'iostat',        # I/O statistics
-    'vmstat',        # Virtual memory statistics
-    'netstat',       # Network statistics
-    'ss',            # Socket statistics
-    'nload',         # Network load monitor
-    'iftop',         # Network bandwidth monitor
-    'nethogs',       # Per-process network monitor
-    'atop',          # System and process monitor
-    'powertop',      # Power consumption monitor
-    'journalctl -f', # System log monitoring
-    'dstat',         # System resource statistics
-    'mpstat',        # Processor statistics
-    'perf',          # Performance monitoring
-    'strace',        # System call tracing
-    'docker logs -f', # Docker container log following
-    'kubectl logs -f', # Kubernetes pod log following
-    'docker stats',   # Docker container statistics
-    'kubectl top',    # Kubernetes resource usage
-]
+# Commands that run continuously
+CONTINUOUS_COMMANDS = {
+    'ping': {'timeout': 30, 'sample_size': 5},  # 30 seconds, show 5 pings
+    'tail -f': {'timeout': 60, 'sample_size': 10},  # 60 seconds, show last 10 lines
+    'top': {'timeout': 30, 'sample_size': 10},  # 30 seconds, show 10 updates
+    'htop': {'timeout': 30, 'sample_size': 10},
+    'watch': {'timeout': 30, 'sample_size': 5},
+}
 
 # Define signals based on platform
 try:
@@ -130,124 +110,86 @@ def kill_process_tree(pid):
     except psutil.NoSuchProcess:
         pass
 
-def is_continuous_command(command: str) -> bool:
-    """Check if a command is expected to run continuously."""
-    return any(cont_cmd in command.lower() for cont_cmd in CONTINUOUS_COMMANDS)
+def is_continuous_command(command: str) -> tuple[bool, dict]:
+    """Check if a command is continuous and return its settings."""
+    cmd_lower = command.lower()
+    for cmd, settings in CONTINUOUS_COMMANDS.items():
+        if cmd in cmd_lower:
+            return True, settings
+    return False, {}
 
-async def stream_output(process, update: Update, first_message=None):
-    """Stream output from a process back to Telegram."""
-    log("[DEBUG] Stream output started")
-    buffer = ""
-    last_send_time = 0
-    message_to_update = first_message
-
+async def run_with_timeout(command: str, timeout: int, update: Update) -> None:
+    """Run a command with timeout and return periodic snapshots."""
     try:
-        while True:
-            # Check if process is still running
-            try:
-                if process.returncode is not None:
-                    log(f"[DEBUG] Process ended with return code: {process.returncode}")
-                    break
-            except Exception as e:
-                log(f"[ERROR] Error checking process status: {str(e)}")
+        # Create process
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT
+        )
+
+        # Store process
+        user_id = update.effective_user.id
+        user_processes[user_id] = process
+
+        # Send initial message
+        await update.message.reply_text(
+            f"Running command with {timeout}s timeout.\n"
+            "Use /stop to end early."
+        )
+
+        output_lines = []
+        start_time = datetime.now()
+        
+        while (datetime.now() - start_time).seconds < timeout:
+            if process.returncode is not None:
                 break
 
             try:
-                # Read output line by line
-                line = await process.stdout.readline()
-                if not line:
-                    log("[DEBUG] No more output to read")
-                    # Check if process is still running despite no output
-                    if process.returncode is None:
-                        await asyncio.sleep(1)  # Wait a bit before next read
-                        continue
-                    break
-
-                decoded_line = line.decode().strip()
-                log(f"[DEBUG] Read line: {decoded_line}")
-                buffer += decoded_line + "\n"
-
-                # Send update every 5 seconds or when buffer gets large
-                current_time = datetime.now().timestamp()
-                if current_time - last_send_time >= 5 or len(buffer) > 3000:
-                    if buffer:
-                        log(f"[DEBUG] Sending buffer of size: {len(buffer)}")
-                        # Truncate buffer if too long
-                        if len(buffer) > 4000:
-                            buffer = buffer[-4000:]
-
-                        # Update existing message or send new one
-                        try:
-                            if message_to_update:
-                                await message_to_update.edit_text(f"```\n{buffer}\n```", parse_mode='Markdown')
-                                log("[DEBUG] Updated existing message")
-                            else:
-                                message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
-                                log("[DEBUG] Sent new message")
-                        except Exception as e:
-                            log(f"[ERROR] Error sending message: {str(e)}")
-                            # If edit fails, send as new message
-                            message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
-
-                        buffer = ""
-                        last_send_time = current_time
-
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=1.0)
+                if line:
+                    output_lines.append(line.decode().strip())
+            except asyncio.TimeoutError:
+                continue
             except Exception as e:
-                log(f"[ERROR] Error reading output: {str(e)}")
+                await update.message.reply_text(f"Error reading output: {str(e)}")
                 break
+
+            # Send periodic updates
+            if len(output_lines) >= 5:
+                await update.message.reply_text(
+                    "```\n" + "\n".join(output_lines[-5:]) + "\n```",
+                    parse_mode='Markdown'
+                )
+                output_lines = []
+
+        # Send any remaining output
+        if output_lines:
+            await update.message.reply_text(
+                "```\n" + "\n".join(output_lines) + "\n```",
+                parse_mode='Markdown'
+            )
+
+        # Clean up
+        try:
+            process.terminate()
+            await asyncio.sleep(1)
+            if process.returncode is None:
+                process.kill()
+        except:
+            pass
+
+        if user_id in user_processes:
+            del user_processes[user_id]
+
+        await update.message.reply_text(
+            "Command completed. Use the same command again for more output."
+        )
 
     except Exception as e:
-        log(f"[ERROR] Stream error: {str(e)}")
-        await update.message.reply_text(f"Error streaming output: {str(e)}")
-    finally:
-        log("[DEBUG] Stream output ended")
-        # Send any remaining buffer
-        if buffer:
-            try:
-                await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
-            except Exception as e:
-                log(f"[ERROR] Error sending final buffer: {str(e)}")
-
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stop running command for the user."""
-    if not is_authenticated(update):
-        return
-
-    user_id = update.effective_user.id
-    if user_id in user_processes:
-        process = user_processes[user_id]
-        try:
-            # Get process and all children
-            parent = psutil.Process(process.pid)
-            children = parent.children(recursive=True)
-            
-            # Terminate them all
-            for child in children:
-                child.terminate()
-            parent.terminate()
-            
-            # Wait briefly for graceful termination
-            await asyncio.sleep(1)
-            
-            # Force kill any remaining processes
-            for child in children:
-                try:
-                    child.kill()
-                except psutil.NoSuchProcess:
-                    pass
-            try:
-                parent.kill()
-            except psutil.NoSuchProcess:
-                pass
-            
-            del user_processes[user_id]
-            await update.message.reply_text("Command stopped successfully.")
-        except Exception as e:
-            await update.message.reply_text(f"Error stopping command: {str(e)}")
-            if user_id in user_processes:
-                del user_processes[user_id]
-    else:
-        await update.message.reply_text("No running command to stop.")
+        await update.message.reply_text(f"Error executing command: {str(e)}")
+        if update.effective_user.id in user_processes:
+            del user_processes[update.effective_user.id]
 
 async def execute_shell_command(update: Update, command: str) -> None:
     """Execute a shell command and return the output."""
@@ -265,71 +207,27 @@ async def execute_shell_command(update: Update, command: str) -> None:
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
 
-        # Debug logging
-        log(f"[DEBUG] Command received: {command}")
-        log(f"[DEBUG] Command parts: cmd='{cmd}', args='{args}'")
-
         # Map of common commands to their full paths
         cmd_paths = {
-            # File and system commands
             'ls': '/bin/ls',
+            'tail': '/usr/bin/tail',
+            'ps': '/usr/bin/ps',
+            'df': '/usr/bin/df',
+            'htop': '/usr/bin/htop',
             'cat': '/bin/cat',
             'head': '/usr/bin/head',
-            'tail': '/usr/bin/tail',
-            
-            # Process monitoring
-            'ps': '/usr/bin/ps',
-            'top': '/usr/bin/top',
-            'htop': '/usr/bin/htop',
-            'atop': '/usr/bin/atop',
-            'iotop': '/usr/bin/iotop',
-            'powertop': '/usr/bin/powertop',
-            
-            # System monitoring
-            'df': '/usr/bin/df',
-            'vmstat': '/usr/bin/vmstat',
-            'iostat': '/usr/bin/iostat',
-            'mpstat': '/usr/bin/mpstat',
-            'dstat': '/usr/bin/dstat',
-            'perf': '/usr/bin/perf',
-            
-            # Network monitoring
-            'ping': '/usr/bin/ping',
-            'tcpdump': '/usr/bin/tcpdump',
-            'netstat': '/usr/bin/netstat',
-            'ss': '/usr/bin/ss',
-            'nload': '/usr/bin/nload',
-            'iftop': '/usr/bin/iftop',
-            'nethogs': '/usr/bin/nethogs',
-            
-            # Container and service management
             'docker': '/usr/bin/docker',
-            'kubectl': '/usr/bin/kubectl',
             'systemctl': '/usr/bin/systemctl',
             'journalctl': '/usr/bin/journalctl',
-            
-            # Other utilities
-            'watch': '/usr/bin/watch',
-            'strace': '/usr/bin/strace'
+            'ping': '/usr/bin/ping'
         }
-
-        # Debug - Check if command is continuous
-        is_continuous = is_continuous_command(command)
-        log(f"[DEBUG] Is continuous command: {is_continuous}")
 
         # Commands that need sudo
         sudo_commands = [
             'tail',
             'journalctl',
             'systemctl',
-            'docker',
-            'tcpdump',
-            'iotop',
-            'nethogs',
-            'iftop',
-            'powertop',
-            'perf',
-            'strace'
+            'docker'
         ]
 
         # Build the command with proper path and sudo if needed
@@ -349,70 +247,53 @@ async def execute_shell_command(update: Update, command: str) -> None:
         if cmd == 'tail' and '/var/log' in args:
             command = f"sudo {cmd_paths['tail']} {args}"
 
-        # Log the actual command being executed
-        log(f"[INFO] Executing command: {command}")
-
-        # Check for existing process and stop it
-        user_id = update.effective_user.id
-        if user_id in user_processes:
-            log("[DEBUG] Stopping existing process")
-            try:
-                process = user_processes[user_id]
-                parent = psutil.Process(process.pid)
-                parent.terminate()
-                await asyncio.sleep(1)
-                if parent.is_running():
-                    parent.kill()
-            except (psutil.NoSuchProcess, Exception) as e:
-                log(f"[ERROR] Error stopping existing process: {str(e)}")
-            finally:
-                del user_processes[user_id]
-
-        # Create new process with line buffering
-        log("[DEBUG] Creating new process")
-        process = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,  # Redirect stderr to stdout
-            bufsize=1  # Line buffering
-        )
-
-        log(f"[DEBUG] Process created with PID: {process.pid}")
-        user_processes[user_id] = process
-
         # Check if this is a continuous command
+        is_continuous, settings = is_continuous_command(command)
         if is_continuous:
-            log("[DEBUG] Starting continuous command handling")
-            await update.message.reply_text(
-                "⚠️ This is a continuous command. Output will be streamed every 5 seconds.\n"
-                "Use /stop to end the command."
+            await run_with_timeout(
+                command,
+                settings['timeout'],
+                update
             )
-            # Start streaming output
-            log("[DEBUG] Starting output streaming")
-            await stream_output(process, update)
-            log("[DEBUG] Stream output completed")
         else:
-            log("[DEBUG] Handling as regular command")
-            stdout, stderr = await process.communicate()
+            # For regular commands, just run and return output
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT
+            )
             
-            # Clear process from storage
-            if user_id in user_processes and user_processes[user_id] == process:
-                del user_processes[user_id]
-
-            output = stdout.decode() if stdout else stderr.decode()
-            if not output:
-                output = "Command executed successfully (no output)"
-
+            stdout, _ = await process.communicate()
+            
+            output = stdout.decode() if stdout else "Command executed successfully (no output)"
+            
             # Split long outputs into chunks
             for i in range(0, len(output), 4000):
                 chunk = output[i:i+4000]
                 await update.message.reply_text(f"```\n{chunk}\n```", parse_mode='Markdown')
 
     except Exception as e:
-        log(f"[ERROR] Error executing command: {str(e)}")
         await update.message.reply_text(f"Error executing command: {str(e)}")
-        if update.effective_user.id in user_processes:
-            del user_processes[update.effective_user.id]
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop running command for the user."""
+    if not is_authenticated(update):
+        return
+
+    user_id = update.effective_user.id
+    if user_id in user_processes:
+        process = user_processes[user_id]
+        try:
+            process.terminate()
+            await asyncio.sleep(1)
+            if process.returncode is None:
+                process.kill()
+            del user_processes[user_id]
+            await update.message.reply_text("Command stopped.")
+        except Exception as e:
+            await update.message.reply_text(f"Error stopping command: {str(e)}")
+    else:
+        await update.message.reply_text("No running command to stop.")
 
 async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle commands that start with /."""
