@@ -19,6 +19,35 @@ BOT_PASSWORD = os.getenv('BOT_PASSWORD')
 authenticated_users = set()
 user_processes = {}
 
+# Commands that are known to run continuously
+CONTINUOUS_COMMANDS = [
+    'ping',           # Network connectivity testing
+    'tail -f',        # File monitoring
+    'top',           # Process monitoring
+    'htop',          # Interactive process monitoring
+    'watch',         # Periodic command execution
+    'tcpdump',       # Network packet capture
+    'iotop',         # I/O monitoring
+    'iostat',        # I/O statistics
+    'vmstat',        # Virtual memory statistics
+    'netstat',       # Network statistics
+    'ss',            # Socket statistics
+    'nload',         # Network load monitor
+    'iftop',         # Network bandwidth monitor
+    'nethogs',       # Per-process network monitor
+    'atop',          # System and process monitor
+    'powertop',      # Power consumption monitor
+    'journalctl -f', # System log monitoring
+    'dstat',         # System resource statistics
+    'mpstat',        # Processor statistics
+    'perf',          # Performance monitoring
+    'strace',        # System call tracing
+    'docker logs -f', # Docker container log following
+    'kubectl logs -f', # Kubernetes pod log following
+    'docker stats',   # Docker container statistics
+    'kubectl top',    # Kubernetes resource usage
+]
+
 # Define signals based on platform
 try:
     SIGKILL = signal.SIGKILL
@@ -40,7 +69,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "1. Just type commands directly: ls -la\n"
         "2. Commands are case-insensitive\n"
         "3. Use /stop to end running commands\n"
-        "4. Open multiple chats for different tasks"
+        "4. For continuous commands (ping, tail -f, etc.):\n"
+        "   - Output will be streamed every 5 seconds\n"
+        "   - Use /stop to end the command\n"
+        "5. Open multiple chats for different tasks"
     )
 
 async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -85,6 +117,54 @@ def kill_process_tree(pid):
     except psutil.NoSuchProcess:
         pass
 
+def is_continuous_command(command: str) -> bool:
+    """Check if a command is expected to run continuously."""
+    return any(cont_cmd in command.lower() for cont_cmd in CONTINUOUS_COMMANDS)
+
+async def stream_output(process, update: Update, first_message=None):
+    """Stream output from a process back to Telegram."""
+    buffer = ""
+    last_send_time = 0
+    message_to_update = first_message
+
+    while True:
+        try:
+            # Check if process is still running
+            if process.returncode is not None:
+                break
+
+            # Read a chunk of output
+            chunk = await process.stdout.read(1024)
+            if not chunk:
+                break
+
+            buffer += chunk.decode()
+
+            # Send update every 5 seconds or when buffer gets large
+            current_time = datetime.now().timestamp()
+            if current_time - last_send_time >= 5 or len(buffer) > 3000:
+                if buffer:
+                    # Truncate buffer if too long
+                    if len(buffer) > 4000:
+                        buffer = buffer[-4000:]
+
+                    # Update existing message or send new one
+                    try:
+                        if message_to_update:
+                            await message_to_update.edit_text(f"```\n{buffer}\n```", parse_mode='Markdown')
+                        else:
+                            message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
+                    except Exception:
+                        # If edit fails, send as new message
+                        message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
+
+                    buffer = ""
+                    last_send_time = current_time
+
+        except Exception as e:
+            await update.message.reply_text(f"Error streaming output: {str(e)}")
+            break
+
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Stop running command for the user."""
     if not is_authenticated(update):
@@ -94,11 +174,35 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if user_id in user_processes:
         process = user_processes[user_id]
         try:
-            kill_process_tree(process.pid)
+            # Get process and all children
+            parent = psutil.Process(process.pid)
+            children = parent.children(recursive=True)
+            
+            # Terminate them all
+            for child in children:
+                child.terminate()
+            parent.terminate()
+            
+            # Wait briefly for graceful termination
+            await asyncio.sleep(1)
+            
+            # Force kill any remaining processes
+            for child in children:
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            try:
+                parent.kill()
+            except psutil.NoSuchProcess:
+                pass
+            
             del user_processes[user_id]
-            await update.message.reply_text("Command stopped.")
+            await update.message.reply_text("Command stopped successfully.")
         except Exception as e:
             await update.message.reply_text(f"Error stopping command: {str(e)}")
+            if user_id in user_processes:
+                del user_processes[user_id]
     else:
         await update.message.reply_text("No running command to stop.")
 
@@ -120,21 +224,62 @@ async def execute_shell_command(update: Update, command: str) -> None:
 
         # Map of common commands to their full paths
         cmd_paths = {
+            # File and system commands
             'ls': '/bin/ls',
-            'tail': '/usr/bin/tail',
-            'ps': '/usr/bin/ps',
-            'df': '/usr/bin/df',
-            'htop': '/usr/bin/htop',
             'cat': '/bin/cat',
             'head': '/usr/bin/head',
+            'tail': '/usr/bin/tail',
+            
+            # Process monitoring
+            'ps': '/usr/bin/ps',
+            'top': '/usr/bin/top',
+            'htop': '/usr/bin/htop',
+            'atop': '/usr/bin/atop',
+            'iotop': '/usr/bin/iotop',
+            'powertop': '/usr/bin/powertop',
+            
+            # System monitoring
+            'df': '/usr/bin/df',
+            'vmstat': '/usr/bin/vmstat',
+            'iostat': '/usr/bin/iostat',
+            'mpstat': '/usr/bin/mpstat',
+            'dstat': '/usr/bin/dstat',
+            'perf': '/usr/bin/perf',
+            
+            # Network monitoring
+            'ping': '/usr/bin/ping',
+            'tcpdump': '/usr/bin/tcpdump',
+            'netstat': '/usr/bin/netstat',
+            'ss': '/usr/bin/ss',
+            'nload': '/usr/bin/nload',
+            'iftop': '/usr/bin/iftop',
+            'nethogs': '/usr/bin/nethogs',
+            
+            # Container and service management
             'docker': '/usr/bin/docker',
+            'kubectl': '/usr/bin/kubectl',
             'systemctl': '/usr/bin/systemctl',
             'journalctl': '/usr/bin/journalctl',
-            'ping': '/usr/bin/ping'
+            
+            # Other utilities
+            'watch': '/usr/bin/watch',
+            'strace': '/usr/bin/strace'
         }
 
         # Commands that need sudo
-        sudo_commands = ['tail', 'journalctl', 'systemctl', 'docker']
+        sudo_commands = [
+            'tail',
+            'journalctl',
+            'systemctl',
+            'docker',
+            'tcpdump',
+            'iotop',
+            'nethogs',
+            'iftop',
+            'powertop',
+            'perf',
+            'strace'
+        ]
 
         # Build the command with proper path and sudo if needed
         if cmd in cmd_paths:
@@ -153,13 +298,23 @@ async def execute_shell_command(update: Update, command: str) -> None:
         if cmd == 'tail' and '/var/log' in args:
             command = f"sudo {cmd_paths['tail']} {args}"
 
-        # Log the actual command being executed for debugging
+        # Log the actual command being executing
         print(f"Executing command: {command}")
 
-        # Kill any existing process for this user
+        # Check for existing process and stop it
         user_id = update.effective_user.id
         if user_id in user_processes:
-            kill_process_tree(user_processes[user_id].pid)
+            try:
+                process = user_processes[user_id]
+                parent = psutil.Process(process.pid)
+                parent.terminate()
+                await asyncio.sleep(1)
+                if parent.is_running():
+                    parent.kill()
+            except (psutil.NoSuchProcess, Exception):
+                pass
+            finally:
+                del user_processes[user_id]
 
         # Create new process
         process = await asyncio.create_subprocess_shell(
@@ -169,20 +324,31 @@ async def execute_shell_command(update: Update, command: str) -> None:
         )
 
         user_processes[user_id] = process
-        stdout, stderr = await process.communicate()
 
-        # Clear process from storage after it's done
-        if user_id in user_processes and user_processes[user_id] == process:
-            del user_processes[user_id]
+        # Check if this is a continuous command
+        if is_continuous_command(command):
+            await update.message.reply_text(
+                "⚠️ This is a continuous command. Output will be streamed every 5 seconds.\n"
+                "Use /stop to end the command."
+            )
+            # Start streaming output
+            await stream_output(process, update)
+        else:
+            # For regular commands, wait for completion
+            stdout, stderr = await process.communicate()
+            
+            # Clear process from storage
+            if user_id in user_processes and user_processes[user_id] == process:
+                del user_processes[user_id]
 
-        output = stdout.decode() if stdout else stderr.decode()
-        if not output:
-            output = "Command executed successfully (no output)"
+            output = stdout.decode() if stdout else stderr.decode()
+            if not output:
+                output = "Command executed successfully (no output)"
 
-        # Split long outputs into chunks to avoid Telegram message length limits
-        for i in range(0, len(output), 4000):
-            chunk = output[i:i+4000]
-            await update.message.reply_text(f"```\n{chunk}\n```", parse_mode='Markdown')
+            # Split long outputs into chunks
+            for i in range(0, len(output), 4000):
+                chunk = output[i:i+4000]
+                await update.message.reply_text(f"```\n{chunk}\n```", parse_mode='Markdown')
 
     except Exception as e:
         await update.message.reply_text(f"Error executing command: {str(e)}")
