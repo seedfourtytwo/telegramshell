@@ -46,7 +46,7 @@ except AttributeError:
     SIGTERM = 15
 
 def log(message):
-    """Write directly to stderr for immediate feedback."""
+    """Log message to stderr for systemd journal."""
     print(message, file=sys.stderr, flush=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -120,92 +120,127 @@ def is_continuous_command(command: str) -> tuple[bool, dict]:
 
 async def run_with_timeout(command: str, timeout: int, update: Update) -> None:
     """Run a command with timeout and return periodic snapshots."""
+    log(f"Starting run_with_timeout for command: {command}")
     try:
         # Create process
+        log("Creating subprocess...")
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT
+            stderr=asyncio.subprocess.PIPE,  # Capture stderr separately
+            preexec_fn=os.setsid  # Create new process group
         )
+        log(f"Process created with PID: {process.pid}")
 
         # Store process
         user_id = update.effective_user.id
         user_processes[user_id] = process
+        log(f"Process stored for user {user_id}")
 
         # Send initial message
         await update.message.reply_text(
             f"Running command with {timeout}s timeout.\n"
             "Use /stop to end early."
         )
+        log("Sent initial message")
 
         output_lines = []
         start_time = datetime.now()
         
         while (datetime.now() - start_time).seconds < timeout:
             if process.returncode is not None:
+                log(f"Process ended with return code: {process.returncode}")
                 break
 
             try:
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=1.0)
-                if line:
-                    output_lines.append(line.decode().strip())
+                # Read from both stdout and stderr
+                stdout_data = await asyncio.wait_for(process.stdout.readline(), timeout=1.0)
+                if stdout_data:
+                    line = stdout_data.decode().strip()
+                    log(f"Read line from stdout: {line}")
+                    output_lines.append(line)
+                
+                stderr_data = await asyncio.wait_for(process.stderr.readline(), timeout=1.0)
+                if stderr_data:
+                    line = stderr_data.decode().strip()
+                    log(f"Read line from stderr: {line}")
+                    output_lines.append(f"stderr: {line}")
+
             except asyncio.TimeoutError:
+                log("Timeout reading output, continuing...")
                 continue
             except Exception as e:
+                log(f"Error reading output: {str(e)}")
                 await update.message.reply_text(f"Error reading output: {str(e)}")
                 break
 
             # Send periodic updates
             if len(output_lines) >= 5:
-                await update.message.reply_text(
-                    "```\n" + "\n".join(output_lines[-5:]) + "\n```",
-                    parse_mode='Markdown'
-                )
+                log(f"Sending update with {len(output_lines)} lines")
+                message = "```\n" + "\n".join(output_lines[-5:]) + "\n```"
+                try:
+                    await update.message.reply_text(message, parse_mode='Markdown')
+                    log("Update sent successfully")
+                except Exception as e:
+                    log(f"Error sending update: {str(e)}")
                 output_lines = []
 
         # Send any remaining output
         if output_lines:
-            await update.message.reply_text(
-                "```\n" + "\n".join(output_lines) + "\n```",
-                parse_mode='Markdown'
-            )
+            log(f"Sending final output with {len(output_lines)} lines")
+            message = "```\n" + "\n".join(output_lines) + "\n```"
+            try:
+                await update.message.reply_text(message, parse_mode='Markdown')
+                log("Final output sent successfully")
+            except Exception as e:
+                log(f"Error sending final output: {str(e)}")
 
         # Clean up
+        log("Cleaning up process...")
         try:
-            process.terminate()
+            # Kill the entire process group
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             await asyncio.sleep(1)
             if process.returncode is None:
-                process.kill()
-        except:
-            pass
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            log("Process terminated")
+        except Exception as e:
+            log(f"Error terminating process: {str(e)}")
 
         if user_id in user_processes:
             del user_processes[user_id]
+            log(f"Removed process for user {user_id}")
 
         await update.message.reply_text(
             "Command completed. Use the same command again for more output."
         )
+        log("Command completion message sent")
 
     except Exception as e:
+        log(f"Error in run_with_timeout: {str(e)}")
         await update.message.reply_text(f"Error executing command: {str(e)}")
         if update.effective_user.id in user_processes:
             del user_processes[update.effective_user.id]
 
 async def execute_shell_command(update: Update, command: str) -> None:
     """Execute a shell command and return the output."""
+    log(f"Executing command: {command}")
     try:
         # Remove 'sudo' if user added it
         if command.startswith('sudo '):
             command = command[5:]
+            log("Removed sudo prefix")
 
         # Convert first word to lowercase for case-insensitive commands
         parts = command.split(maxsplit=1)
         if not parts:
+            log("Empty command received")
             return
 
         # Convert command to lowercase and handle paths
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
+        log(f"Parsed command: cmd='{cmd}', args='{args}'")
 
         # Map of common commands to their full paths
         cmd_paths = {
@@ -237,19 +272,23 @@ async def execute_shell_command(update: Update, command: str) -> None:
             else:
                 command = f"{cmd_paths[cmd]} {args}"
         else:
-            # For other commands, just use lowercase version
             if cmd in sudo_commands:
                 command = f"sudo {cmd} {args}"
             else:
                 command = f"{cmd} {args}"
+        log(f"Final command: {command}")
 
         # Special handling for tail command with log files
         if cmd == 'tail' and '/var/log' in args:
             command = f"sudo {cmd_paths['tail']} {args}"
+            log("Added sudo for log file access")
 
         # Check if this is a continuous command
         is_continuous, settings = is_continuous_command(command)
+        log(f"Command continuous: {is_continuous}, settings: {settings}")
+        
         if is_continuous:
+            log("Handling as continuous command")
             await run_with_timeout(
                 command,
                 settings['timeout'],
@@ -257,6 +296,7 @@ async def execute_shell_command(update: Update, command: str) -> None:
             )
         else:
             # For regular commands, just run and return output
+            log("Handling as regular command")
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
@@ -264,35 +304,45 @@ async def execute_shell_command(update: Update, command: str) -> None:
             )
             
             stdout, _ = await process.communicate()
+            log("Regular command completed")
             
             output = stdout.decode() if stdout else "Command executed successfully (no output)"
+            log(f"Output length: {len(output)}")
             
             # Split long outputs into chunks
             for i in range(0, len(output), 4000):
                 chunk = output[i:i+4000]
                 await update.message.reply_text(f"```\n{chunk}\n```", parse_mode='Markdown')
+                log(f"Sent chunk of size {len(chunk)}")
 
     except Exception as e:
+        log(f"Error in execute_shell_command: {str(e)}")
         await update.message.reply_text(f"Error executing command: {str(e)}")
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Stop running command for the user."""
+    log("Stop command received")
     if not is_authenticated(update):
+        log("User not authenticated")
         return
 
     user_id = update.effective_user.id
     if user_id in user_processes:
         process = user_processes[user_id]
         try:
-            process.terminate()
+            log(f"Stopping process for user {user_id}")
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             await asyncio.sleep(1)
             if process.returncode is None:
-                process.kill()
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
             del user_processes[user_id]
             await update.message.reply_text("Command stopped.")
+            log("Process stopped successfully")
         except Exception as e:
+            log(f"Error stopping process: {str(e)}")
             await update.message.reply_text(f"Error stopping command: {str(e)}")
     else:
+        log("No process to stop")
         await update.message.reply_text("No running command to stop.")
 
 async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
