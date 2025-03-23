@@ -19,6 +19,14 @@ BOT_PASSWORD = os.getenv('BOT_PASSWORD')
 authenticated_users = set()
 user_processes = {}
 
+# Define signals based on platform
+try:
+    SIGKILL = signal.SIGKILL
+    SIGTERM = signal.SIGTERM
+except AttributeError:
+    SIGKILL = 9
+    SIGTERM = 15
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
     if update.effective_user.id not in ALLOWED_USERS:
@@ -51,6 +59,32 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text("Invalid password.")
 
+def kill_process_tree(pid):
+    """Kill a process and all its children."""
+    try:
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+        
+        for child in children:
+            try:
+                child.terminate()
+            except psutil.NoSuchProcess:
+                pass
+                
+        parent.terminate()
+        
+        # Wait for processes to terminate
+        _, alive = psutil.wait_procs([parent] + children, timeout=1)
+        
+        # Force kill if still alive
+        for p in alive:
+            try:
+                p.kill()
+            except psutil.NoSuchProcess:
+                pass
+    except psutil.NoSuchProcess:
+        pass
+
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Stop running command for the user."""
     if not is_authenticated(update):
@@ -60,19 +94,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if user_id in user_processes:
         process = user_processes[user_id]
         try:
-            # Get the process group ID
-            pgid = os.getpgid(process.pid)
-            
-            # Kill the entire process group
-            os.killpg(pgid, signal.SIGTERM)
-            
-            # Wait a bit and force kill if still running
-            await asyncio.sleep(1)
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass  # Process already terminated
-                
+            kill_process_tree(process.pid)
             del user_processes[user_id]
             await update.message.reply_text("Command stopped.")
         except Exception as e:
@@ -134,26 +156,19 @@ async def execute_shell_command(update: Update, command: str) -> None:
         # Log the actual command being executed for debugging
         print(f"Executing command: {command}")
 
-        # Create a new process group
+        # Kill any existing process for this user
+        user_id = update.effective_user.id
+        if user_id in user_processes:
+            kill_process_tree(user_processes[user_id].pid)
+
+        # Create new process
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            preexec_fn=os.setsid  # Create new process group
+            stderr=asyncio.subprocess.PIPE
         )
 
-        # Store process for potential stopping
-        user_id = update.effective_user.id
-        if user_id in user_processes:
-            # Kill any existing process before starting new one
-            try:
-                old_pgid = os.getpgid(user_processes[user_id].pid)
-                os.killpg(old_pgid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-
         user_processes[user_id] = process
-
         stdout, stderr = await process.communicate()
 
         # Clear process from storage after it's done
