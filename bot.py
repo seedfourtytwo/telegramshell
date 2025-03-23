@@ -123,6 +123,7 @@ def is_continuous_command(command: str) -> bool:
 
 async def stream_output(process, update: Update, first_message=None):
     """Stream output from a process back to Telegram."""
+    print("Debug - Stream output started")
     buffer = ""
     last_send_time = 0
     message_to_update = first_message
@@ -131,19 +132,23 @@ async def stream_output(process, update: Update, first_message=None):
         try:
             # Check if process is still running
             if process.returncode is not None:
+                print(f"Debug - Process ended with return code: {process.returncode}")
                 break
 
             # Read a chunk of output
             chunk = await process.stdout.read(1024)
             if not chunk:
+                print("Debug - No more output to read")
                 break
 
+            print(f"Debug - Read chunk of size: {len(chunk)}")
             buffer += chunk.decode()
 
             # Send update every 5 seconds or when buffer gets large
             current_time = datetime.now().timestamp()
             if current_time - last_send_time >= 5 or len(buffer) > 3000:
                 if buffer:
+                    print(f"Debug - Sending buffer of size: {len(buffer)}")
                     # Truncate buffer if too long
                     if len(buffer) > 4000:
                         buffer = buffer[-4000:]
@@ -152,9 +157,12 @@ async def stream_output(process, update: Update, first_message=None):
                     try:
                         if message_to_update:
                             await message_to_update.edit_text(f"```\n{buffer}\n```", parse_mode='Markdown')
+                            print("Debug - Updated existing message")
                         else:
                             message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
-                    except Exception:
+                            print("Debug - Sent new message")
+                    except Exception as e:
+                        print(f"Debug - Error sending message: {str(e)}")
                         # If edit fails, send as new message
                         message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
 
@@ -162,8 +170,11 @@ async def stream_output(process, update: Update, first_message=None):
                     last_send_time = current_time
 
         except Exception as e:
+            print(f"Debug - Stream error: {str(e)}")
             await update.message.reply_text(f"Error streaming output: {str(e)}")
             break
+
+    print("Debug - Stream output ended")
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Stop running command for the user."""
@@ -222,6 +233,10 @@ async def execute_shell_command(update: Update, command: str) -> None:
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
 
+        # Debug logging
+        print(f"Debug - Command received: {command}")
+        print(f"Debug - Command parts: cmd='{cmd}', args='{args}'")
+
         # Map of common commands to their full paths
         cmd_paths = {
             # File and system commands
@@ -266,6 +281,10 @@ async def execute_shell_command(update: Update, command: str) -> None:
             'strace': '/usr/bin/strace'
         }
 
+        # Debug - Check if command is continuous
+        is_continuous = is_continuous_command(command)
+        print(f"Debug - Is continuous command: {is_continuous}")
+
         # Commands that need sudo
         sudo_commands = [
             'tail',
@@ -298,12 +317,13 @@ async def execute_shell_command(update: Update, command: str) -> None:
         if cmd == 'tail' and '/var/log' in args:
             command = f"sudo {cmd_paths['tail']} {args}"
 
-        # Log the actual command being executing
-        print(f"Executing command: {command}")
+        # Log the actual command being executed
+        print(f"Debug - Final command to execute: {command}")
 
         # Check for existing process and stop it
         user_id = update.effective_user.id
         if user_id in user_processes:
+            print("Debug - Stopping existing process")
             try:
                 process = user_processes[user_id]
                 parent = psutil.Process(process.pid)
@@ -311,30 +331,37 @@ async def execute_shell_command(update: Update, command: str) -> None:
                 await asyncio.sleep(1)
                 if parent.is_running():
                     parent.kill()
-            except (psutil.NoSuchProcess, Exception):
-                pass
+            except (psutil.NoSuchProcess, Exception) as e:
+                print(f"Debug - Error stopping existing process: {str(e)}")
             finally:
                 del user_processes[user_id]
 
         # Create new process
+        print("Debug - Creating new process")
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            # Enable line buffering
+            bufsize=1
         )
 
+        print(f"Debug - Process created with PID: {process.pid}")
         user_processes[user_id] = process
 
         # Check if this is a continuous command
-        if is_continuous_command(command):
+        if is_continuous:
+            print("Debug - Starting continuous command handling")
             await update.message.reply_text(
                 "⚠️ This is a continuous command. Output will be streamed every 5 seconds.\n"
                 "Use /stop to end the command."
             )
             # Start streaming output
+            print("Debug - Starting output streaming")
             await stream_output(process, update)
+            print("Debug - Stream output completed")
         else:
-            # For regular commands, wait for completion
+            print("Debug - Handling as regular command")
             stdout, stderr = await process.communicate()
             
             # Clear process from storage
@@ -351,6 +378,7 @@ async def execute_shell_command(update: Update, command: str) -> None:
                 await update.message.reply_text(f"```\n{chunk}\n```", parse_mode='Markdown')
 
     except Exception as e:
+        print(f"Debug - Error executing command: {str(e)}")
         await update.message.reply_text(f"Error executing command: {str(e)}")
         if update.effective_user.id in user_processes:
             del user_processes[update.effective_user.id]
