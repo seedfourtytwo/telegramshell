@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 import signal
 import psutil
@@ -63,6 +64,10 @@ try:
 except AttributeError:
     SIGKILL = 9
     SIGTERM = 15
+
+def log(message):
+    """Write directly to stderr for immediate feedback."""
+    print(message, file=sys.stderr, flush=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
@@ -131,7 +136,7 @@ def is_continuous_command(command: str) -> bool:
 
 async def stream_output(process, update: Update, first_message=None):
     """Stream output from a process back to Telegram."""
-    logger.debug("Stream output started")
+    log("[DEBUG] Stream output started")
     buffer = ""
     last_send_time = 0
     message_to_update = first_message
@@ -141,31 +146,32 @@ async def stream_output(process, update: Update, first_message=None):
             # Check if process is still running
             try:
                 if process.returncode is not None:
-                    logger.debug(f"Process ended with return code: {process.returncode}")
+                    log(f"[DEBUG] Process ended with return code: {process.returncode}")
                     break
             except Exception as e:
-                logger.error(f"Error checking process status: {str(e)}")
+                log(f"[ERROR] Error checking process status: {str(e)}")
                 break
 
             try:
                 # Read output line by line
                 line = await process.stdout.readline()
                 if not line:
-                    logger.debug("No more output to read")
+                    log("[DEBUG] No more output to read")
                     # Check if process is still running despite no output
                     if process.returncode is None:
                         await asyncio.sleep(1)  # Wait a bit before next read
                         continue
                     break
 
-                logger.debug(f"Read line: {line.decode().strip()}")
-                buffer += line.decode()
+                decoded_line = line.decode().strip()
+                log(f"[DEBUG] Read line: {decoded_line}")
+                buffer += decoded_line + "\n"
 
                 # Send update every 5 seconds or when buffer gets large
                 current_time = datetime.now().timestamp()
                 if current_time - last_send_time >= 5 or len(buffer) > 3000:
                     if buffer:
-                        logger.debug(f"Sending buffer of size: {len(buffer)}")
+                        log(f"[DEBUG] Sending buffer of size: {len(buffer)}")
                         # Truncate buffer if too long
                         if len(buffer) > 4000:
                             buffer = buffer[-4000:]
@@ -174,12 +180,12 @@ async def stream_output(process, update: Update, first_message=None):
                         try:
                             if message_to_update:
                                 await message_to_update.edit_text(f"```\n{buffer}\n```", parse_mode='Markdown')
-                                logger.debug("Updated existing message")
+                                log("[DEBUG] Updated existing message")
                             else:
                                 message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
-                                logger.debug("Sent new message")
+                                log("[DEBUG] Sent new message")
                         except Exception as e:
-                            logger.error(f"Error sending message: {str(e)}")
+                            log(f"[ERROR] Error sending message: {str(e)}")
                             # If edit fails, send as new message
                             message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
 
@@ -187,20 +193,20 @@ async def stream_output(process, update: Update, first_message=None):
                         last_send_time = current_time
 
             except Exception as e:
-                logger.error(f"Error reading output: {str(e)}")
+                log(f"[ERROR] Error reading output: {str(e)}")
                 break
 
     except Exception as e:
-        logger.error(f"Stream error: {str(e)}")
+        log(f"[ERROR] Stream error: {str(e)}")
         await update.message.reply_text(f"Error streaming output: {str(e)}")
     finally:
-        logger.debug("Stream output ended")
+        log("[DEBUG] Stream output ended")
         # Send any remaining buffer
         if buffer:
             try:
                 await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
             except Exception as e:
-                logger.error(f"Error sending final buffer: {str(e)}")
+                log(f"[ERROR] Error sending final buffer: {str(e)}")
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Stop running command for the user."""
@@ -260,8 +266,8 @@ async def execute_shell_command(update: Update, command: str) -> None:
         args = parts[1] if len(parts) > 1 else ""
 
         # Debug logging
-        logger.debug(f"Command received: {command}")
-        logger.debug(f"Command parts: cmd='{cmd}', args='{args}'")
+        log(f"[DEBUG] Command received: {command}")
+        log(f"[DEBUG] Command parts: cmd='{cmd}', args='{args}'")
 
         # Map of common commands to their full paths
         cmd_paths = {
@@ -309,7 +315,7 @@ async def execute_shell_command(update: Update, command: str) -> None:
 
         # Debug - Check if command is continuous
         is_continuous = is_continuous_command(command)
-        logger.debug(f"Is continuous command: {is_continuous}")
+        log(f"[DEBUG] Is continuous command: {is_continuous}")
 
         # Commands that need sudo
         sudo_commands = [
@@ -344,12 +350,12 @@ async def execute_shell_command(update: Update, command: str) -> None:
             command = f"sudo {cmd_paths['tail']} {args}"
 
         # Log the actual command being executed
-        logger.info(f"Executing command: {command}")
+        log(f"[INFO] Executing command: {command}")
 
         # Check for existing process and stop it
         user_id = update.effective_user.id
         if user_id in user_processes:
-            logger.debug("Stopping existing process")
+            log("[DEBUG] Stopping existing process")
             try:
                 process = user_processes[user_id]
                 parent = psutil.Process(process.pid)
@@ -358,12 +364,12 @@ async def execute_shell_command(update: Update, command: str) -> None:
                 if parent.is_running():
                     parent.kill()
             except (psutil.NoSuchProcess, Exception) as e:
-                logger.error(f"Error stopping existing process: {str(e)}")
+                log(f"[ERROR] Error stopping existing process: {str(e)}")
             finally:
                 del user_processes[user_id]
 
         # Create new process with line buffering
-        logger.debug("Creating new process")
+        log("[DEBUG] Creating new process")
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
@@ -371,22 +377,22 @@ async def execute_shell_command(update: Update, command: str) -> None:
             bufsize=1  # Line buffering
         )
 
-        logger.debug(f"Process created with PID: {process.pid}")
+        log(f"[DEBUG] Process created with PID: {process.pid}")
         user_processes[user_id] = process
 
         # Check if this is a continuous command
         if is_continuous:
-            logger.debug("Starting continuous command handling")
+            log("[DEBUG] Starting continuous command handling")
             await update.message.reply_text(
                 "⚠️ This is a continuous command. Output will be streamed every 5 seconds.\n"
                 "Use /stop to end the command."
             )
             # Start streaming output
-            logger.debug("Starting output streaming")
+            log("[DEBUG] Starting output streaming")
             await stream_output(process, update)
-            logger.debug("Stream output completed")
+            log("[DEBUG] Stream output completed")
         else:
-            logger.debug("Handling as regular command")
+            log("[DEBUG] Handling as regular command")
             stdout, stderr = await process.communicate()
             
             # Clear process from storage
@@ -403,7 +409,7 @@ async def execute_shell_command(update: Update, command: str) -> None:
                 await update.message.reply_text(f"```\n{chunk}\n```", parse_mode='Markdown')
 
     except Exception as e:
-        logger.error(f"Error executing command: {str(e)}")
+        log(f"[ERROR] Error executing command: {str(e)}")
         await update.message.reply_text(f"Error executing command: {str(e)}")
         if update.effective_user.id in user_processes:
             del user_processes[update.effective_user.id]
