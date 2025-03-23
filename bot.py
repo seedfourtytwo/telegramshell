@@ -29,171 +29,97 @@ BOT_PASSWORD = os.getenv('BOT_PASSWORD')
 authenticated_users = set()
 user_processes = {}
 
-# Commands that run continuously
-CONTINUOUS_COMMANDS = {
-    'ping': {'timeout': 30, 'sample_size': 5},  # 30 seconds, show 5 pings
-    'tail -f': {'timeout': 60, 'sample_size': 10},  # 60 seconds, show last 10 lines
-    'top': {'timeout': 30, 'sample_size': 10},  # 30 seconds, show 10 updates
-    'htop': {'timeout': 30, 'sample_size': 10},
-    'watch': {'timeout': 30, 'sample_size': 5},
-}
+def is_continuous_command(command: str) -> bool:
+    """Check if a command is expected to run continuously."""
+    continuous_commands = ['ping', 'tail -f', 'top', 'htop', 'watch']
+    return any(cmd in command.lower() for cmd in continuous_commands)
 
-def kill_process_tree(pid):
-    """Kill a process and all its children."""
-    try:
-        parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
-        
-        # First try to terminate gracefully
-        for child in children:
-            try:
-                child.terminate()
-            except psutil.NoSuchProcess:
-                pass
-                
-        parent.terminate()
-        
-        # Wait for processes to terminate
-        _, alive = psutil.wait_procs([parent] + children, timeout=1)
-        
-        # Force kill if still alive
-        for p in alive:
-            try:
-                p.kill()
-            except psutil.NoSuchProcess:
-                pass
-    except psutil.NoSuchProcess:
-        pass
-
-def is_continuous_command(command: str) -> tuple[bool, dict]:
-    """Check if a command is continuous and return its settings."""
-    cmd_lower = command.lower()
-    for cmd, settings in CONTINUOUS_COMMANDS.items():
-        if cmd in cmd_lower:
-            return True, settings
-    return False, {}
-
-async def run_with_timeout(command: str, timeout: int, update: Update) -> None:
-    """Run a command with timeout and return periodic snapshots."""
-    logger.debug(f"Starting run_with_timeout for command: {command}")
+async def handle_continuous_command(command: str, update: Update) -> None:
+    """Handle a continuous command with real-time output."""
     try:
         # Create process
-        logger.debug("Creating subprocess...")
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,  # Capture stderr separately
-            preexec_fn=os.setsid  # Create new process group
+            stderr=asyncio.subprocess.PIPE,
+            preexec_fn=os.setsid
         )
-        logger.debug(f"Process created with PID: {process.pid}")
+        print(f"Started continuous command: {command} with PID {process.pid}", file=sys.stderr)
 
         # Store process
         user_id = update.effective_user.id
+        if user_id in user_processes:
+            try:
+                old_process = user_processes[user_id]
+                os.killpg(os.getpgid(old_process.pid), signal.SIGKILL)
+            except:
+                pass
         user_processes[user_id] = process
-        logger.debug(f"Process stored for user {user_id}")
 
         # Send initial message
         await update.message.reply_text(
-            f"Running command with {timeout}s timeout.\n"
-            "Use /stop to end early."
+            "Running continuous command. Output will be streamed.\n"
+            "Use /stop to end the command."
         )
 
-        output_lines = []
-        start_time = datetime.now()
-        
-        while (datetime.now() - start_time).seconds < timeout:
+        # Stream output
+        while True:
             if process.returncode is not None:
-                logger.debug(f"Process ended with return code: {process.returncode}")
+                print(f"Process ended with return code: {process.returncode}", file=sys.stderr)
                 break
 
             try:
-                # Read from both stdout and stderr
+                # Read with timeout to allow checking returncode
                 stdout_data = await asyncio.wait_for(process.stdout.readline(), timeout=1.0)
                 if stdout_data:
                     line = stdout_data.decode().strip()
-                    logger.debug(f"Read line from stdout: {line}")
-                    output_lines.append(line)
-                
+                    print(f"Output: {line}", file=sys.stderr)
+                    await update.message.reply_text(f"`{line}`", parse_mode='Markdown')
+
                 stderr_data = await asyncio.wait_for(process.stderr.readline(), timeout=1.0)
                 if stderr_data:
                     line = stderr_data.decode().strip()
-                    logger.debug(f"Read line from stderr: {line}")
-                    output_lines.append(f"stderr: {line}")
+                    print(f"Error: {line}", file=sys.stderr)
+                    await update.message.reply_text(f"Error: `{line}`", parse_mode='Markdown')
 
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
-                logger.error(f"Error reading output: {str(e)}")
-                await update.message.reply_text(f"Error reading output: {str(e)}")
+                print(f"Error reading output: {str(e)}", file=sys.stderr)
+                await update.message.reply_text(f"Error: {str(e)}")
                 break
 
-            # Send periodic updates
-            if len(output_lines) >= 5:
-                logger.debug(f"Sending update with {len(output_lines)} lines")
-                message = "```\n" + "\n".join(output_lines[-5:]) + "\n```"
-                try:
-                    await update.message.reply_text(message, parse_mode='Markdown')
-                except Exception as e:
-                    logger.error(f"Error sending update: {str(e)}")
-                output_lines = []
+    except Exception as e:
+        print(f"Error in continuous command: {str(e)}", file=sys.stderr)
+        await update.message.reply_text(f"Error: {str(e)}")
 
-        # Send any remaining output
-        if output_lines:
-            logger.debug(f"Sending final output with {len(output_lines)} lines")
-            message = "```\n" + "\n".join(output_lines) + "\n```"
-            try:
-                await update.message.reply_text(message, parse_mode='Markdown')
-            except Exception as e:
-                logger.error(f"Error sending final output: {str(e)}")
-
+    finally:
         # Clean up
-        logger.debug("Cleaning up process...")
         try:
-            # Kill the entire process group
-            pgid = os.getpgid(process.pid)
-            os.killpg(pgid, signal.SIGTERM)
-            await asyncio.sleep(1)
             if process.returncode is None:
-                os.killpg(pgid, signal.SIGKILL)
-            logger.debug("Process terminated")
-        except Exception as e:
-            logger.error(f"Error terminating process: {str(e)}")
-            # Fallback to psutil if process group handling fails
-            kill_process_tree(process.pid)
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except:
+            pass
 
         if user_id in user_processes:
             del user_processes[user_id]
-            logger.debug(f"Removed process for user {user_id}")
-
-        await update.message.reply_text(
-            "Command completed. Use the same command again for more output."
-        )
-
-    except Exception as e:
-        logger.error(f"Error in run_with_timeout: {str(e)}")
-        await update.message.reply_text(f"Error executing command: {str(e)}")
-        if update.effective_user.id in user_processes:
-            del user_processes[update.effective_user.id]
 
 async def execute_shell_command(update: Update, command: str) -> None:
     """Execute a shell command and return the output."""
-    logger.debug(f"Executing command: {command}")
+    print(f"Executing command: {command}", file=sys.stderr)
     try:
         # Remove 'sudo' if user added it
         if command.startswith('sudo '):
             command = command[5:]
-            logger.debug("Removed sudo prefix")
 
         # Convert first word to lowercase for case-insensitive commands
         parts = command.split(maxsplit=1)
         if not parts:
-            logger.debug("Empty command received")
             return
 
         # Convert command to lowercase and handle paths
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
-        logger.debug(f"Parsed command: cmd='{cmd}', args='{args}'")
 
         # Map of common commands to their full paths
         cmd_paths = {
@@ -229,73 +155,56 @@ async def execute_shell_command(update: Update, command: str) -> None:
                 command = f"sudo {cmd} {args}"
             else:
                 command = f"{cmd} {args}"
-        logger.debug(f"Final command: {command}")
 
         # Special handling for tail command with log files
         if cmd == 'tail' and '/var/log' in args:
             command = f"sudo {cmd_paths['tail']} {args}"
-            logger.debug("Added sudo for log file access")
+
+        print(f"Final command: {command}", file=sys.stderr)
 
         # Check if this is a continuous command
-        is_continuous, settings = is_continuous_command(command)
-        logger.debug(f"Command continuous: {is_continuous}, settings: {settings}")
+        if is_continuous_command(command):
+            print("Handling as continuous command", file=sys.stderr)
+            await handle_continuous_command(command, update)
+            return
+
+        # For regular commands, just run and return output
+        print("Handling as regular command", file=sys.stderr)
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT
+        )
         
-        if is_continuous:
-            logger.debug("Handling as continuous command")
-            await run_with_timeout(
-                command,
-                settings['timeout'],
-                update
-            )
-        else:
-            # For regular commands, just run and return output
-            logger.debug("Handling as regular command")
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT
-            )
-            
-            stdout, _ = await process.communicate()
-            logger.debug("Regular command completed")
-            
-            output = stdout.decode() if stdout else "Command executed successfully (no output)"
-            logger.debug(f"Output length: {len(output)}")
-            
-            # Split long outputs into chunks
-            for i in range(0, len(output), 4000):
-                chunk = output[i:i+4000]
-                await update.message.reply_text(f"```\n{chunk}\n```", parse_mode='Markdown')
-                logger.debug(f"Sent chunk of size {len(chunk)}")
+        stdout, _ = await process.communicate()
+        output = stdout.decode() if stdout else "Command executed successfully (no output)"
+        
+        # Split long outputs into chunks
+        for i in range(0, len(output), 4000):
+            chunk = output[i:i+4000]
+            await update.message.reply_text(f"```\n{chunk}\n```", parse_mode='Markdown')
 
     except Exception as e:
-        logger.error(f"Error in execute_shell_command: {str(e)}")
+        print(f"Error executing command: {str(e)}", file=sys.stderr)
         await update.message.reply_text(f"Error executing command: {str(e)}")
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Stop running command for the user."""
-    logger.debug("Stop command received")
     if not is_authenticated(update):
-        logger.debug("User not authenticated")
         return
 
     user_id = update.effective_user.id
     if user_id in user_processes:
         process = user_processes[user_id]
         try:
-            logger.debug(f"Stopping process for user {user_id}")
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            await asyncio.sleep(1)
-            if process.returncode is None:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
             del user_processes[user_id]
             await update.message.reply_text("Command stopped.")
-            logger.debug("Process stopped successfully")
+            print(f"Stopped process for user {user_id}", file=sys.stderr)
         except Exception as e:
-            logger.error(f"Error stopping process: {str(e)}")
+            print(f"Error stopping process: {str(e)}", file=sys.stderr)
             await update.message.reply_text(f"Error stopping command: {str(e)}")
     else:
-        logger.debug("No process to stop")
         await update.message.reply_text("No running command to stop.")
 
 async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
