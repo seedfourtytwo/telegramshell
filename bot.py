@@ -128,53 +128,71 @@ async def stream_output(process, update: Update, first_message=None):
     last_send_time = 0
     message_to_update = first_message
 
-    while True:
-        try:
+    try:
+        while True:
             # Check if process is still running
-            if process.returncode is not None:
-                print(f"Debug - Process ended with return code: {process.returncode}")
+            try:
+                if process.returncode is not None:
+                    print(f"Debug - Process ended with return code: {process.returncode}")
+                    break
+            except Exception as e:
+                print(f"Debug - Error checking process status: {str(e)}")
                 break
 
-            # Read a chunk of output
-            chunk = await process.stdout.read(1024)
-            if not chunk:
-                print("Debug - No more output to read")
-                break
+            try:
+                # Read output line by line
+                line = await process.stdout.readline()
+                if not line:
+                    print("Debug - No more output to read")
+                    # Check if process is still running despite no output
+                    if process.returncode is None:
+                        await asyncio.sleep(1)  # Wait a bit before next read
+                        continue
+                    break
 
-            print(f"Debug - Read chunk of size: {len(chunk)}")
-            buffer += chunk.decode()
+                print(f"Debug - Read line: {line.decode().strip()}")
+                buffer += line.decode()
 
-            # Send update every 5 seconds or when buffer gets large
-            current_time = datetime.now().timestamp()
-            if current_time - last_send_time >= 5 or len(buffer) > 3000:
-                if buffer:
-                    print(f"Debug - Sending buffer of size: {len(buffer)}")
-                    # Truncate buffer if too long
-                    if len(buffer) > 4000:
-                        buffer = buffer[-4000:]
+                # Send update every 5 seconds or when buffer gets large
+                current_time = datetime.now().timestamp()
+                if current_time - last_send_time >= 5 or len(buffer) > 3000:
+                    if buffer:
+                        print(f"Debug - Sending buffer of size: {len(buffer)}")
+                        # Truncate buffer if too long
+                        if len(buffer) > 4000:
+                            buffer = buffer[-4000:]
 
-                    # Update existing message or send new one
-                    try:
-                        if message_to_update:
-                            await message_to_update.edit_text(f"```\n{buffer}\n```", parse_mode='Markdown')
-                            print("Debug - Updated existing message")
-                        else:
+                        # Update existing message or send new one
+                        try:
+                            if message_to_update:
+                                await message_to_update.edit_text(f"```\n{buffer}\n```", parse_mode='Markdown')
+                                print("Debug - Updated existing message")
+                            else:
+                                message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
+                                print("Debug - Sent new message")
+                        except Exception as e:
+                            print(f"Debug - Error sending message: {str(e)}")
+                            # If edit fails, send as new message
                             message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
-                            print("Debug - Sent new message")
-                    except Exception as e:
-                        print(f"Debug - Error sending message: {str(e)}")
-                        # If edit fails, send as new message
-                        message_to_update = await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
 
-                    buffer = ""
-                    last_send_time = current_time
+                        buffer = ""
+                        last_send_time = current_time
 
-        except Exception as e:
-            print(f"Debug - Stream error: {str(e)}")
-            await update.message.reply_text(f"Error streaming output: {str(e)}")
-            break
+            except Exception as e:
+                print(f"Debug - Error reading output: {str(e)}")
+                break
 
-    print("Debug - Stream output ended")
+    except Exception as e:
+        print(f"Debug - Stream error: {str(e)}")
+        await update.message.reply_text(f"Error streaming output: {str(e)}")
+    finally:
+        print("Debug - Stream output ended")
+        # Send any remaining buffer
+        if buffer:
+            try:
+                await update.message.reply_text(f"```\n{buffer}\n```", parse_mode='Markdown')
+            except Exception as e:
+                print(f"Debug - Error sending final buffer: {str(e)}")
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Stop running command for the user."""
@@ -336,14 +354,13 @@ async def execute_shell_command(update: Update, command: str) -> None:
             finally:
                 del user_processes[user_id]
 
-        # Create new process
+        # Create new process with line buffering
         print("Debug - Creating new process")
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            # Enable line buffering
-            bufsize=1
+            stderr=asyncio.subprocess.STDOUT,  # Redirect stderr to stdout
+            bufsize=1  # Line buffering
         )
 
         print(f"Debug - Process created with PID: {process.pid}")

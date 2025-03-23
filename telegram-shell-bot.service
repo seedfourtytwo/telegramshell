@@ -6,8 +6,11 @@ After=network.target
 Type=simple
 User=telegram_bot
 WorkingDirectory=/home/telegram_bot/telegramShell
-Environment=PATH=/home/telegram_bot/telegramShell/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/home/telegram_bot/telegramShell/venv/bin/python bot.py
+# Use unbuffered Python output and redirect all output to journal
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/telegram_bot/telegramShell/venv/bin/python -u bot.py
+StandardOutput=journal
+StandardError=journal
 Restart=always
 RestartSec=10
 
